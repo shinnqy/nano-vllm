@@ -10,14 +10,15 @@ from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
+"""本文件负责组装模型"""
 
 class Qwen3Attention(nn.Module):
 
     def __init__(
         self,
         hidden_size: int,
-        num_heads: int,
-        num_kv_heads: int,
+        num_heads: int, # Query 头数，表示”每个 token 产生几组 Q“
+        num_kv_heads: int, # KV 头数，表示”这些 Q 使用几组 K/V 来计算注意力“
         max_position: int = 4096 * 32,
         head_dim: int | None = None,
         rms_norm_eps: float = 1e-06,
@@ -26,7 +27,7 @@ class Qwen3Attention(nn.Module):
         rope_scaling: dict | None = None,
     ) -> None:
         super().__init__()
-        tp_size = dist.get_world_size()
+        tp_size = dist.get_world_size() # [张量并行] 进入模型每一层的位置: 把总 Query 头数和总 KV 头数分别除以 TP 数，得到本 rank 的头数。
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -39,14 +40,14 @@ class Qwen3Attention(nn.Module):
         self.scaling = self.head_dim ** -0.5
         self.qkv_bias = qkv_bias
 
-        self.qkv_proj = QKVParallelLinear(
+        self.qkv_proj = QKVParallelLinear( # [张量并行] 进入模型每一层的位置: Attention 使用 QKVParallelLinear 和 RowParallelLinear
             hidden_size,
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=qkv_bias,
         )
-        self.o_proj = RowParallelLinear(
+        self.o_proj = RowParallelLinear( # 创建并行层的位置
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
@@ -69,11 +70,20 @@ class Qwen3Attention(nn.Module):
             self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
             self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
-    def forward(
+    """
+    这里要串起
+    nano-vllm 的合并 QKV 投影
+        → Q/K Norm
+        → RoPE
+        → 接入分页 KV Cache 的 Attention
+        → 张量并行输出投影
+    """
+    def forward( # [增量 KV Cache] 为本轮输入计算 Q、K、V，再调用 self.attn(q, k, v)
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        # 一次线性投影产生合并输出，然后按本 rank 的 Q/K/V 宽度拆开
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q = q.view(-1, self.num_heads, self.head_dim)
@@ -83,12 +93,13 @@ class Qwen3Attention(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
         q, k = self.rotary_emb(positions, q, k)
-        o = self.attn(q, k, v)
-        output = self.o_proj(o.flatten(1, -1))
+        o = self.attn(q, k, v) # 注意力计算：nano-vllm 准备输入，调用 FlashAttention 提供的实现
+        output = self.o_proj(o.flatten(1, -1)) # RowParallelLinear 前向调用的位置
         return output
 
 
-class Qwen3MLP(nn.Module):
+"""Qwen3 因果语言模型"""
+class Qwen3MLP(nn.Module): # [张量并行] 进入模型每一层的位置: MLP 使用 MergedColumnParallelLinear 和 RowParallelLinear
 
     def __init__(
         self,
@@ -102,7 +113,7 @@ class Qwen3MLP(nn.Module):
             [intermediate_size] * 2,
             bias=False,
         )
-        self.down_proj = RowParallelLinear(
+        self.down_proj = RowParallelLinear( # 创建并行层的位置
             intermediate_size,
             hidden_size,
             bias=False,
@@ -113,10 +124,11 @@ class Qwen3MLP(nn.Module):
     def forward(self, x):
         gate_up = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x = self.down_proj(x)
+        x = self.down_proj(x) # RowParallelLinear 前向调用的位置
         return x
 
 
+"""单个 Decoder Layer"""
 class Qwen3DecoderLayer(nn.Module):
 
     def __init__(
@@ -159,6 +171,7 @@ class Qwen3DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+"""Transformer 主体"""
 class Qwen3Model(nn.Module):
 
     def __init__(
@@ -166,8 +179,8 @@ class Qwen3Model(nn.Module):
         config: Qwen3Config,
     ) -> None:
         super().__init__()
-        self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size) # 词表大小、隐藏维度 来自配置
+        self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)]) # 层数也来自配置
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(

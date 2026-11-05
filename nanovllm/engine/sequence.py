@@ -11,20 +11,38 @@ class SequenceStatus(Enum):
     FINISHED = auto()
 
 
+"""
+Sequence 是请求对象，用来保存：
+    prompt token IDs。
+    采样参数。
+    初始状态 WAITING。
+    KV 缓存进度。
+    KV 块表。
+    输出 token。
+"""
 class Sequence:
     block_size = 256
     counter = count()
 
     def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
+        # 请求编号
         self.seq_id = next(Sequence.counter)
+        # 当前请求状态，初始为 WAITING
         self.status = SequenceStatus.WAITING
+        # 输入与已生成 token 合并后的列表 （token_ids 的结构是 [prompt: 生成结果]）
         self.token_ids = copy(token_ids)
         self.last_token = token_ids[-1]
+        # 请求当前持有的 token 总数，包括已经采样出来的输出 token
         self.num_tokens = len(self.token_ids)
+        # 原始输入长度，用于区分输入和输出
         self.num_prompt_tokens = len(token_ids)
+        # [Paged Attention] 前面多少个 token 已经具有可用 KV
         self.num_cached_tokens = 0
+        # [Paged Attention] 本轮准备为多少个 token 运行模型
         self.num_scheduled_tokens = 0
+        # 影响序列跨进程传输时携带完整 token，还是只携带最后一个 token
         self.is_prefill = True
+        # [Paged Attention] 逻辑块编号到物理块编号的映射
         self.block_table = []
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
@@ -44,10 +62,18 @@ class Sequence:
     def num_completion_tokens(self):
         return self.num_tokens - self.num_prompt_tokens
 
+    """
+    取 原 prompt
+    （token_ids 的结构是 [prompt: 生成结果]）
+    """
     @property
     def prompt_token_ids(self):
         return self.token_ids[:self.num_prompt_tokens]
 
+    """
+    取 生成结果
+    （token_ids 的结构是 [prompt: 生成结果]）
+    """
     @property
     def completion_token_ids(self):
         return self.token_ids[self.num_prompt_tokens:]
@@ -64,6 +90,7 @@ class Sequence:
         assert 0 <= i < self.num_blocks
         return self.token_ids[i*self.block_size: (i+1)*self.block_size]
 
+    """把采样出的 token 追加到 Sequence"""
     def append_token(self, token_id: int):
         self.token_ids.append(token_id)
         self.last_token = token_id
