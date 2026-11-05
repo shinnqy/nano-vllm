@@ -16,8 +16,8 @@ def main():
     prompts = [
         tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],
-            tokenize=False,
-            add_generation_prompt=True,
+            tokenize=False, # 后面会调用 self.tokenizer.encode(prompt) 进行编码，不在这里编码
+            add_generation_prompt=True, # 在末尾追加“轮到 assistant 了”的开头标记
         )
         for prompt in prompts
     ]
